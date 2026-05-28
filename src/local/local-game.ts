@@ -3,11 +3,11 @@
  * It replaces the server: processes game events and sends responses
  * back through EventBus channels that mimic socket.io.
  *
- * The UI code calls localSocket.emit('drawCard', ...) and receives
- * responses through localSocket.on('updateCardList', ...).
+ * IMPORTANT: All toClient.emit() calls are wrapped in defer() to match
+ * socket.io's async delivery. Phaser needs render frames between events.
+ * Callbacks (socket.io acknowledgements) fire synchronously like socket.io.
  */
 import { CoreGame } from '../core/game';
-import { CorePlayer } from '../core/player-state';
 import { CoreCard } from '../core/card';
 import { EventBus } from './event-bus';
 import testDeckData from '../core/test-deck.json';
@@ -46,13 +46,29 @@ export function createLocalGame(options?: {
   // EventBus for sending events TO the UI (server → client direction)
   const toClient = new EventBus();
 
+  /** Defer event delivery to next microtask — matches socket.io async behavior */
+  function defer(fn: () => void): void {
+    setTimeout(fn, 0);
+  }
+
+  /** Send an event to the client asynchronously */
+  function send(event: string, ...args: any[]): void {
+    defer(() => toClient.emit(event, ...args));
+  }
+
+  /** Send multiple events with small delays between them so Phaser can render */
+  function sendSequence(events: Array<[string, ...any[]]>, delayMs = 16): void {
+    events.forEach(([event, ...args], i) => {
+      setTimeout(() => toClient.emit(event, ...args), i * delayMs);
+    });
+  }
+
   // The socket-like object the UI will use
   const socket: LocalSocket = {
     id: 'local-player-1',
     disconnected: false,
 
     emit(event: string, ...args: any[]): void {
-      // Process the event as the server would
       handleClientEvent(event, args);
     },
 
@@ -82,30 +98,40 @@ export function createLocalGame(options?: {
   function handleClientEvent(event: string, args: any[]): void {
     switch (event) {
       case 'queue':
-        // Auto-start the game
         setTimeout(() => startGame(), 100);
         break;
 
       case 'boardFullyLoaded':
         player.boardReady = true;
-        // In local mode, bot is always ready
         opponent.boardReady = true;
-        setTimeout(() => toClient.emit('mulligan', {}), 300);
+        setTimeout(() => toClient.emit('mulligan', {}), 500);
         break;
 
       case 'onMulligan': {
         const data = args[0];
         const doMulligan = data?.mulligan === 'mulligan';
         game.mulligan(1, doMulligan);
-        // Auto-mulligan for bot (keep)
         game.mulligan(2, false);
+
         if (game.bothPlayersMulliganed()) {
-          toClient.emit('mulliganDone', {});
-          // Start first turn
-          const firstPlayer = game.getCurrentPlayer();
-          toClient.emit('changeTurn', {
-            personToChangeTurnTo: firstPlayer === player ? socket.id : 'bot',
-            turnNumber: game.turnNumber,
+          // Defer mulliganDone so Phaser can process the button click first
+          defer(() => {
+            toClient.emit('mulliganDone', {});
+
+            // If bot goes first, run bot turn then give control to player
+            if (game.getCurrentPlayer() === opponent) {
+              setTimeout(() => {
+                botTurn();
+              }, 300);
+            } else {
+              // Player goes first
+              setTimeout(() => {
+                toClient.emit('changeTurn', {
+                  personToChangeTurnTo: socket.id,
+                  turnNumber: game.turnNumber,
+                });
+              }, 200);
+            }
           });
         }
         break;
@@ -115,6 +141,7 @@ export function createLocalGame(options?: {
         const amount = args[0] || 1;
         const callback = args[1];
         player.drawCard(amount);
+        // Callbacks fire synchronously (socket.io acknowledgement pattern)
         if (callback) {
           callback({
             cards: serializeCardList(player.hand.list()),
@@ -128,8 +155,7 @@ export function createLocalGame(options?: {
         const data = args[0];
         const amount = data?.amount ?? 1;
         player.drawDon(amount);
-        // Send updated don area
-        toClient.emit('updateCardList', {
+        send('updateCardList', {
           cards: serializeCardList(player.donArea.list()),
           type: 'donArea',
         });
@@ -138,7 +164,7 @@ export function createLocalGame(options?: {
 
       case 'shuffleHandToDeck':
         player.shuffleHandToDeck(game.rng);
-        toClient.emit('updateCardList', {
+        send('updateCardList', {
           cards: serializeCardList(player.hand.list()),
           type: 'hand',
         });
@@ -153,52 +179,67 @@ export function createLocalGame(options?: {
         const cardPlayed = player.playCard(data.index);
         if (!cardPlayed) break;
 
+        const events: Array<[string, any]> = [];
+
         if (cardPlayed.isCharacterCard()) {
-          toClient.emit('updateCardList', {
+          events.push(['updateCardList', {
             cards: serializeCardList(player.characterArea.list()),
             type: 'characterArea',
-          });
+          }]);
         } else {
-          toClient.emit('updateCardList', {
+          events.push(['updateCardList', {
             cards: serializeCardList(player.trash.list()),
             type: 'trash',
-          });
+          }]);
         }
-        toClient.emit('updateCardList', {
+        events.push(['updateCardList', {
           cards: serializeCardList(player.hand.list()),
           type: 'hand',
-        });
-        toClient.emit('updateCardList', {
+        }]);
+        events.push(['updateCardList', {
           cards: serializeCardList(player.donArea.list()),
           type: 'donArea',
-        });
+        }]);
+
+        // Broadcast to opponent
+        events.push(['opponentRemoveCardFromHand', { amount: 1 }]);
+        if (cardPlayed.isCharacterCard()) {
+          events.push(['opponentUpdateCharacterArea', {
+            cards: serializeCardList(player.characterArea.list()),
+          }]);
+        }
+
+        sendSequence(events);
         break;
       }
 
       case 'refreshPhase':
         if (!game.isPlayersTurn(player)) break;
         player.refreshPhase();
-        // Leader summoning sickness for turns 2-3
         if (game.turnNumber === 2 || game.turnNumber === 3) {
           if (player.leader) player.leader.summoningSickness = false;
         }
-        toClient.emit('updateCardList', {
-          cards: serializeCardList(player.characterArea.list()),
-          type: 'characterArea',
-        });
-        toClient.emit('updateCardList', {
-          cards: serializeCardList(player.donArea.list()),
-          type: 'donArea',
-        });
+        sendSequence([
+          ['updateCardList', {
+            cards: serializeCardList(player.characterArea.list()),
+            type: 'characterArea',
+          }],
+          ['updateCardList', {
+            cards: serializeCardList(player.donArea.list()),
+            type: 'donArea',
+          }],
+        ]);
         break;
 
       case 'endTurn': {
+        send('chatMessage', {
+          message: `Server: ${playerName} ended their turn.`,
+        });
         game.changeTurn();
-        // If it's now the bot's turn, auto-play then end
         if (game.isPlayersTurn(opponent)) {
-          botTurn();
+          setTimeout(() => botTurn(), 300);
         } else {
-          toClient.emit('changeTurn', {
+          send('changeTurn', {
             personToChangeTurnTo: socket.id,
             turnNumber: game.turnNumber,
           });
@@ -216,6 +257,7 @@ export function createLocalGame(options?: {
         const cardIndex = args[0];
         const callback = args[1];
         player.attachDon(cardIndex);
+        // Callback fires synchronously (acknowledgement)
         if (callback) callback(serializeCardList(player.donArea.list()));
         break;
       }
@@ -247,14 +289,23 @@ export function createLocalGame(options?: {
           player.leader.isResting = true;
         }
 
-        // Bot never blocks for now
-        if (callback) callback(-3); // Skip block code
+        // Resolve attack on the core game
+        const attackerSource = cardAttackingIsLeader ? 'leader' as const : cardAttackingIndex;
+        const defenderTarget = cardDefendingIsLeader ? 'leader' as const : cardDefendingIndex;
+        try {
+          game.resolveAttack(1, attackerSource, defenderTarget);
+        } catch {
+          // Attack resolution failed, just rest the card
+        }
+
+        // Bot never blocks for now — send skip-block code
+        if (callback) callback(-3);
         break;
       }
 
       case 'chatMessage': {
         const data = args[0];
-        toClient.emit('chatMessage', { message: data.message });
+        send('chatMessage', { message: data.message });
         break;
       }
 
@@ -270,6 +321,9 @@ export function createLocalGame(options?: {
     game.start();
     game.setupPhase();
 
+    // Always make the human player go first for better UX
+    game.whoseTurn = 1;
+
     toClient.emit('start', {
       name: playerName,
       opponentName: opponentName,
@@ -280,7 +334,7 @@ export function createLocalGame(options?: {
   }
 
   function botTurn(): void {
-    // Simple bot: refresh, draw, don, then end turn
+    // Simple bot: refresh, draw, don, play what it can, then end turn
     opponent.refreshPhase();
     if (game.turnNumber === 2 || game.turnNumber === 3) {
       if (opponent.leader) opponent.leader.summoningSickness = false;
@@ -291,35 +345,43 @@ export function createLocalGame(options?: {
     const donAmount = game.turnNumber === 0 ? 1 : 2;
     opponent.drawDon(donAmount);
 
-    // Bot plays characters it can afford
-    const playable = opponent.hand.list().filter(
-      c => c.isCharacterCard() && c.cost <= opponent.getUnrestedDonCount() && opponent.characterArea.size() < 5
-    );
-    for (const card of playable) {
-      const idx = opponent.hand.list().indexOf(card);
-      if (idx !== -1) {
-        opponent.playCard(idx);
+    // Bot plays characters it can afford (re-scan after each play since indices shift)
+    let played = true;
+    while (played) {
+      played = false;
+      for (let i = 0; i < opponent.hand.size(); i++) {
+        const c = opponent.hand.get(i);
+        if (c && c.isCharacterCard() && c.cost <= opponent.getUnrestedDonCount() && opponent.characterArea.size() < 5) {
+          opponent.playCard(i);
+          played = true;
+          break;
+        }
       }
     }
 
-    // Update opponent areas for the UI
-    toClient.emit('opponentUpdateCharacterArea', {
+    // Send opponent area updates to the UI with delays
+    const events: Array<[string, any]> = [];
+    events.push(['opponentUpdateCharacterArea', {
       cards: serializeCardList(opponent.characterArea.list()),
-    });
-    toClient.emit('opponentDrawDon', { amount: donAmount });
-    toClient.emit('opponentDrawCard', { amount: game.turnNumber !== 0 ? 1 : 0 });
+    }]);
+    if (game.turnNumber !== 0) {
+      events.push(['opponentDrawCard', { amount: 1 }]);
+    }
+    events.push(['opponentDrawDon', { amount: donAmount }]);
+    events.push(['chatMessage', {
+      message: `Server: ${opponentName} ended their turn.`,
+    }]);
 
-    // End bot turn
+    sendSequence(events);
+
+    // End bot turn and give control back to player
     setTimeout(() => {
       game.changeTurn();
       toClient.emit('changeTurn', {
         personToChangeTurnTo: socket.id,
         turnNumber: game.turnNumber,
       });
-      toClient.emit('chatMessage', {
-        message: `Server: ${opponentName} ended their turn.`,
-      });
-    }, 500);
+    }, events.length * 16 + 300);
   }
 
   return { socket, start: () => {} };
